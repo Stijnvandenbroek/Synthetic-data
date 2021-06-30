@@ -1,0 +1,634 @@
+---
+title: "Synthetic data"
+author: "Stijn van den Broek"
+date: "02/07/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(magrittr)
+library(corrplot)
+library(mice)
+library(furrr)
+library(purrr)
+library(broom)
+library(caret)
+library(mboost)
+library(e1071)
+library(xtable)
+library(DT)
+library(psych)
+```
+
+## Setting the seed
+
+```{r}
+set.seed(123)
+```
+
+## Reading the data
+
+```{r}
+data = read.csv('Data/diabetes.csv')
+data$Outcome = factor(data$Outcome, levels = c(0, 1))
+```
+
+## Creating a version of the data where the missing data is imputed with a low amount of iterations and a high amount of iterations
+
+```{r}
+imputed_data = data
+
+imputed_data[,2:8][imputed_data[,2:8] == 0] = NA #setting all zeroes from all columns apart from pregnancies and outcome to NA
+
+print(md.pattern(imputed_data))
+
+imputed_data = mice(imputed_data, m=5, maxit=5, meth='pmm', seed=123)
+imputed_data = complete(imputed_data, 1)
+```
+
+# Functions
+
+### Function for obtaining statistical properties
+
+```{r}
+statistical_properties = function(dataframe){
+  stats = data.frame()
+  for (i in seq(1, length(colnames(dataframe)), 1)) {
+    column_data = as.numeric(dataframe[,i])
+    term = colnames(dataframe)[i]
+    mean = mean(column_data)
+    standard_deviation = sd(column_data)
+    skewness = skewness(column_data)
+    kurtosis = kurtosis(column_data)
+    standard_error = sd(column_data)/sqrt(length(column_data))
+    row = data.frame(term = term, mean = mean, standard_deviation = standard_deviation, skewness = skewness, kurtosis = kurtosis, standard_error = standard_error)
+    stats = rbind(stats, row)
+  }
+  return(stats)
+}
+```
+
+### Function for plotting distributions
+
+```{r}
+dataset_distribution = function(dataframe, bins = 20) {
+  ggplot(gather(dataframe), aes(as.numeric(value))) + 
+    geom_histogram(bins = bins) + 
+    facet_wrap(~key, scales = 'free_x')
+}
+```
+
+### Synthesizing function and imputation methods
+
+```{r}
+synthesize = function(dataframe, method = "cart", bootstrap = FALSE, m = 5, nsim = 100, maxit = 1, cp = 0.0001) {
+  set.seed(123)
+  if (bootstrap == TRUE){
+    syn <- future_map(1:nsim, function(x){
+                  mice(dataframe[sample(1:768, 768, replace = TRUE), ], 
+                          m=m, 
+                          meth = method, 
+                          where = matrix(TRUE, nrow(dataframe), ncol(dataframe)), 
+                          cp = cp,
+                          minbucket = 3,
+                          print = FALSE)}, 
+                  .options = furrr_options(seed = as.integer(123)), .progress = T)
+  }
+  
+  else {
+    syn <- future_map(1:nsim, function(x){
+                  mice(dataframe, 
+                          m=m, 
+                          meth = method, 
+                          where = matrix(TRUE, nrow(dataframe), ncol(dataframe)), 
+                          cp = cp,
+                          minbucket = 3,
+                          print = FALSE)}, 
+                  .options = furrr_options(seed = as.integer(123)), .progress = T)
+  }
+  
+  return(syn)
+}
+```
+
+### Pooling function for partially synthetic data
+
+```{r}
+pool3.syn <- function(mira) {
+  set.seed(123)
+  if(class(mira)[1] == "mira") { # if the input object is of class mira
+    fitlist <- mira %$% analyses # extract the analyses from the mira object
+  }
+  else {
+    fitlist <- mira              # and otherwise, just take the input list
+  }
+  
+  vars <- fitlist[[1]] %>% coef() %>% names()
+  
+  m <- length(fitlist)           # number of imputations
+  
+  pooled <- fitlist %>% 
+    map_dfr(broom::tidy) %>%
+    group_by(term) %>%
+    summarise(est     = mean(estimate),
+              bm      = sum((estimate - est)^2) / (m - 1),
+              ubar    = mean(std.error^2),
+              var     = ubar + bm/m, # new variance estimate
+              df      = (m - 1) * (1 + (ubar * m)/bm), # and new df estimate
+              lower   = est - qt(.975, df) * sqrt(var),
+              upper   = est + qt(.975, df) * sqrt(var), .groups = 'drop') %>%
+    arrange(factor(term, levels = vars))
+  pooled
+}
+```
+
+### Normal pooling function in accordance with Rubin's rules
+
+```{r}
+pool.normal <- function(mira) {
+  
+  if(class(mira)[1] == "mira") { # if the input object is of class mira
+    fitlist <- mira %$% analyses # extract the analyses from the mira object
+  }
+  else {                         # and otherwise, just take the input list
+    fitlist <- mira
+  }
+  
+  vars <- fitlist[[1]] %>% coef() %>% names()
+  
+  m <- length(fitlist)           # number of imputations
+  
+  pooled <- fitlist %>% 
+    map_dfr(broom::tidy) %>%     # tidy estimates
+    group_by(term) %>%           # group per variable
+    summarise(est     = mean(estimate),
+              bm      = sum((estimate - est)^2) / (m - 1),
+              ubar    = mean(std.error^2),
+              var_u   = (1 + 1/m) * bm + ubar,
+              var     = if_else(var_u > 0, var_u, ubar), # restrict variance to be positive
+              df      = max(1, (m - 1) * (1 - ubar / (bm + bm/m))^2), # restrict df > 1
+              lower   = est - qt(.975, df) * sqrt(var),
+              upper   = est + qt(.975, df) * sqrt(var), .groups = 'drop') %>%
+    arrange(factor(term, levels = vars))
+  pooled
+}
+```
+
+### Confidence interval function
+
+```{r}
+ci_cov <- function(pooled, true_fit = NULL, coefs = NULL, vars = NULL) {
+  set.seed(123)
+  
+  if (!is.null(true_fit)) {
+    coefs <- coef(true_fit)
+    vars   <- diag(vcov(true_fit))
+  }
+  
+  nsim <- nrow(pooled) / length(unique(pooled$term))
+  
+  pooled %>% mutate(true_coef = rep(coefs, times = nsim),
+                    true_var  = rep(vars, times = nsim),
+                    cover     = lower < true_coef & true_coef < upper) %>%
+    group_by(term) %>%
+    summarise("True Est" = unique(true_coef),
+              "Syn Est"  = mean(est),
+              "Bias"     = mean(est - true_coef),
+              "True SE"  = unique(sqrt(true_var)),
+              "Syn SE"   = mean(sqrt(var)),
+              "df"       = mean(df),
+              "Lower"    = mean(lower),
+              "Upper"    = mean(upper),
+              "CIW"      = mean(upper - lower),
+              "Coverage" = mean(cover), .groups = "drop")
+}
+```
+
+### Prediction function
+
+```{r}
+predict_synth_or_true = function(sim, origin) {
+  truemodel <- origin %$%
+  glm(Outcome ~ BMI + Glucose + Pregnancies, family = "binomial") #model
+  
+  sim %>%
+    map(~.x %$% 
+          glm(Outcome ~ BMI + Glucose + Pregnancies, family = "binomial")) %>%
+    map_dfr(pool3.syn) %>%
+    ci_cov(., truemodel) %>% 
+    datatable()
+  
+  out <- sim %>%
+    map(~.x %>% 
+          complete("all") %>%  
+          map(~.x %>% 
+                rbind(origin) %>% 
+                mutate(indic = as.factor(c(rep(0, 768), rep(1, 768)))) %$% 
+                glm(Outcome ~ BMI + Glucose + Pregnancies, family = "binomial")) %>% pool() %>%  summary() %>% as.data.frame() %>% column_to_rownames(var = "term")) %>% 
+    Reduce("+", .) %>% round(digits = 4)
+  datatable(out / 100)
+  
+  do_fun <- function(x){
+    dat <- x %>% 
+      rbind(origin) %>% 
+      mutate(indic = as.factor(c(rep(0, 768), rep(1, 768)))) 
+    fit <- dat %$% 
+      glm(Outcome ~ BMI + Glucose + Pregnancies, family = "binomial") %>% 
+      predict(type = "response")
+    CM <- confusionMatrix(factor(as.numeric(fit > .5)), factor(dat$indic))
+    c(CM$overall, CM$byClass)
+  }
+  sim %>%
+    map(~.x %>% 
+          complete("all") %>%  
+          map(~.x %>% do_fun()) %>% 
+          do.call("rbind", .) %>% colMeans()) %>% 
+    do.call("rbind", .) %>% colMeans() %>% .[c(1, 2, 8, 9, 15, 18)] %>% round(digits = 4)
+}
+```
+
+# The process of synthesizing
+
+### 1. Formulating an analysis model
+
+```{r}
+analysis_model = glm(Outcome~BMI+Glucose+Pregnancies, data = data, family = "binomial")
+```
+
+### 2. Running the analysis model on the data set to obtain the true data inference
+
+```{r}
+summary(analysis_model)
+```
+
+### 3. Obtaining the statistical properties of the true data set
+
+```{r}
+true_statistics = statistical_properties(data)
+```
+
+### 4. Plotting the distributions of the true data set
+
+```{r, warning=FALSE}
+dataset_distribution(data)
+dataset_distribution(imputed_data)
+```
+
+### 5a. Synthesizing the data
+
+```{r, warning=FALSE}
+plan(multisession)
+
+synthesized = synthesize(data, nsim = 1000) #the standard synthesis with original data, no bootstrap and a high cp
+ori_nb_lcp = synthesize(data, nsim = 1000, cp = 1e-32) #synthesis with original data, no bootstrap and a low cp
+orl_b_hcp = synthesize(data, nsim = 1000, bootstrap = TRUE) #synthesis with original data, bootstrap, low iterations and a high cp
+orl_b_lcp = synthesize(data, nsim = 1000, bootstrap = TRUE, cp = 1e-32) #synthesis with original data, bootstrap, low iterations and a low cp
+orh_b_hcp = synthesize(data, nsim = 1000, bootstrap = TRUE, maxit = 5) #synthesis with original data, bootstrap, high iterations and a high cp
+orh_b_lcp = synthesize(data, nsim = 1000, bootstrap = TRUE, cp = 1e-32, maxit = 5) #synthesis with original data, bootstrap, high iterations and a low cp
+
+syn_nb_hcp = synthesize(imputed_data, nsim = 1000) #synthesis with imputed data with no bootstrap and a high cp
+syn_nb_lcp = synthesize(imputed_data, nsim = 1000, cp = 1e-32) #synthesis with imputed data with no bootstrap and a low cp
+hi_b_hcp = synthesize(imputed_data, nsim = 1000, bootstrap = TRUE, maxit = 5)  #synthesis with imputed data with a high amount of iterations, bootstrap and a high cp
+hi_b_lcp = synthesize(imputed_data, nsim = 1000, bootstrap = TRUE, cp = 1e-32, maxit = 5) #synthesis with imputed data with a high amount of iterations, bootstrap and a low cp
+li_b_hcp = synthesize(imputed_data, nsim = 1000, bootstrap = TRUE)  #synthesis with imputed data with a low amount of iterations, bootstrap and a high cp
+li_b_lcp = synthesize(imputed_data, nsim = 1000, bootstrap = TRUE, cp = 1e-32) #synthesis with imputed data with a low amount of iterations, bootstrap and a low cp
+```
+
+### 5b. Calculating the statistical properties of the synthetic sets
+
+```{r, warning=FALSE}
+all_synthetic_statistics = data.frame()
+for (i in seq(1, length(synthesized), 1)) { #looping through each simulation
+  imputation = synthesized[[i]]
+  for (n in seq(1, imputation$m, 1)) { #looping through each imputation of the simulation
+    syndata = complete(imputation, action = n)
+    synthetic_statistics = statistical_properties(syndata)
+    
+    all_synthetic_statistics = rbind(all_synthetic_statistics, synthetic_statistics)
+  }
+}
+```
+
+### 5c. Running the analysis model on each of the synthetic sets
+
+```{r}
+all_synthetic_parameters = data.frame()
+for (i in seq(1, length(synthesized), 1)) { #looping through each simulation
+  imputation = synthesized[[i]]
+  for (n in seq(1, imputation$m, 1)) { #looping through each imputation of the simulation
+    syndata = complete(imputation, action = n)
+    synthetic_parameters = glm(Outcome~BMI+Glucose+Pregnancies, data = syndata, family = "binomial") %>% tidy()
+    all_synthetic_parameters = rbind(all_synthetic_parameters, synthetic_parameters)
+  }
+}
+```
+
+### 5d. Combining the statistics and parameters into single inferences
+
+```{r, warning=FALSE}
+single_synthetic_statistics = data.frame()
+for (i in seq(1, length(unique(all_synthetic_statistics$term)))) {
+  term_data = all_synthetic_statistics[all_synthetic_statistics$term == unique(all_synthetic_statistics$term)[i],] %>%
+    sapply(mean)
+  term_data$term = unique(all_synthetic_statistics$term)[i]
+  term_data = data.frame(term_data)
+  single_synthetic_statistics = rbind(single_synthetic_statistics, term_data)
+}
+
+single_synthetic_parameters = data.frame()
+for (i in seq(1, length(unique(all_synthetic_parameters$term)))) {
+  term_data = all_synthetic_parameters[all_synthetic_parameters$term == unique(all_synthetic_parameters$term)[i],] %>%
+    sapply(mean)
+  term_data$term = unique(all_synthetic_parameters$term)[i]
+  term_data = data.frame(term_data)
+  single_synthetic_parameters = rbind(single_synthetic_parameters, term_data)
+}
+```
+
+### 5e & 5f. Combining half of the imputed set randomly with half of the true set for each of the m imputed sets & running a prediction model that predicts syn or true
+
+```{r}
+imputed_prediction = data.frame(predict_synth_or_true(syn_nb_hcp, imputed_data))
+original_prediction = data.frame(predict_synth_or_true(synthesized, data))
+
+print(imputed_prediction)
+print(original_prediction)
+```
+
+### 5g. Pooling the model parameters
+
+```{r}
+pooled = map_dfr(synthesized, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+poolednorm = map_dfr(synthesized, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled2 = map_dfr(ori_nb_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled2norm = map_dfr(ori_nb_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled3 = map_dfr(orl_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled3norm = map_dfr(orl_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled4 = map_dfr(orl_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled4norm = map_dfr(orl_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled5 = map_dfr(orh_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled5norm = map_dfr(orh_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled6 = map_dfr(orh_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled6norm = map_dfr(orh_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled7 = map_dfr(syn_nb_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled7norm = map_dfr(syn_nb_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled8 = map_dfr(syn_nb_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled8norm = map_dfr(syn_nb_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled9 = map_dfr(hi_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled9norm = map_dfr(hi_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled10 = map_dfr(hi_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled10norm = map_dfr(hi_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled11 = map_dfr(li_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled11norm = map_dfr(li_b_hcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+
+pooled12 = map_dfr(li_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool3.syn()
+})
+
+pooled12norm = map_dfr(li_b_lcp, function(x) {
+  x %$%
+   glm(Outcome ~ BMI+Glucose+Pregnancies, family = 'binomial') %>%
+  pool.normal()
+})
+```
+
+### 6a. Comparing the synthetic statistics and parameters with the true statistics and parameters
+
+```{r}
+true_parameters = data.frame(tidy(analysis_model))
+statistics_difference = single_synthetic_statistics[,2:ncol(single_synthetic_statistics)] - true_statistics[,2:ncol(true_statistics)]
+parameters_difference = single_synthetic_parameters[,2:ncol(single_synthetic_parameters)] - true_parameters[,2:ncol(true_parameters)]
+statistics_difference$term = single_synthetic_statistics$term
+parameters_difference$term = single_synthetic_parameters$term
+statistics_difference = statistics_difference[,c(ncol(statistics_difference),1:(ncol(statistics_difference)-1))]
+parameters_difference = parameters_difference[,c(ncol(parameters_difference),1:(ncol(parameters_difference)-1))]
+
+print(statistics_difference)
+print(parameters_difference)
+```
+
+### 6b. Plotting the distributions of the statistics and parameters
+
+```{r, warning=FALSE}
+repeat_distribution = function(dataframe) {
+  for (i in seq(1, length(unique(dataframe$term)), 1)) {
+    print(unique(dataframe$term)[i])
+    print(dataset_distribution(dataframe[dataframe$term == unique(dataframe$term)[i],]))
+  }
+}
+
+print("Statistics")
+repeat_distribution(all_synthetic_statistics)
+print("Parameters")
+repeat_distribution(all_synthetic_parameters)
+print("Pooling parameters")
+repeat_distribution(pooled)
+```
+
+### 6c. Calculating the confidence interval coverages
+
+```{r}
+true_data = glm(Outcome~BMI+Glucose+Pregnancies, data = data, family = "binomial")
+true_data_imputed = glm(Outcome~BMI+Glucose+Pregnancies, data = imputed_data, family = "binomial")
+
+confidence_interval = ci_cov(pooled, true_fit = true_data)
+confidence_interval2 = ci_cov(pooled2, true_fit = true_data)
+confidence_interval3 = ci_cov(pooled3, true_fit = true_data)
+confidence_interval4 = ci_cov(pooled4, true_fit = true_data)
+confidence_interval5 = ci_cov(pooled5, true_fit = true_data)
+confidence_interval6 = ci_cov(pooled6, true_fit = true_data)
+
+confidence_intervalnorm = ci_cov(poolednorm, true_fit = true_data)
+confidence_interval2norm = ci_cov(pooled2norm, true_fit = true_data)
+confidence_interval3norm = ci_cov(pooled3norm, true_fit = true_data)
+confidence_interval4norm = ci_cov(pooled4norm, true_fit = true_data)
+confidence_interval5norm = ci_cov(pooled5norm, true_fit = true_data)
+confidence_interval6norm = ci_cov(pooled6norm, true_fit = true_data)
+
+confidence_interval7 = ci_cov(pooled7, true_fit = true_data_imputed)
+confidence_interval8 = ci_cov(pooled8, true_fit = true_data_imputed)
+confidence_interval9 = ci_cov(pooled9, true_fit = true_data_imputed)
+confidence_interval10 = ci_cov(pooled10, true_fit = true_data_imputed)
+confidence_interval11 = ci_cov(pooled11, true_fit = true_data_imputed)
+confidence_interval12 = ci_cov(pooled12, true_fit = true_data_imputed)
+
+confidence_interval7norm = ci_cov(pooled7norm, true_fit = true_data_imputed)
+confidence_interval8norm = ci_cov(pooled8norm, true_fit = true_data_imputed)
+confidence_interval9norm = ci_cov(pooled9norm, true_fit = true_data_imputed)
+confidence_interval10norm = ci_cov(pooled10norm, true_fit = true_data_imputed)
+confidence_interval11norm = ci_cov(pooled11norm, true_fit = true_data_imputed)
+confidence_interval12norm = ci_cov(pooled12norm, true_fit = true_data_imputed)
+```
+
+```{r}
+print("The standard synthesis with original data, no bootstrap and a 1e-4 cp with pool3.syn")
+print(confidence_interval[,c(1, 4, 8:11)])
+print("Synthesis with original data, no bootstrap and a 1e-32 cp with pool3.syn")
+print(confidence_interval2[,c(1, 4, 8:11)])
+print("Synthesis with original data, bootstrap, 1 iteration and a 1e-4 cp with pool3.syn")
+print(confidence_interval3[,c(1, 4, 8:11)])
+print("Synthesis with original data, bootstrap, 1 iteration and a 1e-32 cp with pool3.syn")
+print(confidence_interval4[,c(1, 4, 8:11)])
+print("synthesis with original data, bootstrap, 5 iterations and a 1e-4 cp with pool3.syn")
+print(confidence_interval5[,c(1, 4, 8:11)])
+print("synthesis with original data, bootstrap, 5 iterations and a 1e-32 cp with pool3.syn")
+print(confidence_interval6[,c(1, 4, 8:11)])
+
+print("The standard synthesis with original data, no bootstrap and a 1e-4 cp with pool.normal")
+print(confidence_intervalnorm[,c(1, 4, 8:11)])
+print("Synthesis with original data, no bootstrap and a 1e-32 cp with pool.normal")
+print(confidence_interval2norm[,c(1, 4, 8:11)])
+print("Synthesis with original data, bootstrap, 1 iteration and a 1e-4 cp with pool.normal")
+print(confidence_interval3norm[,c(1, 4, 8:11)])
+print("Synthesis with original data, bootstrap, 1 iteration and a 1e-32 cp with pool.normal")
+print(confidence_interval4norm[,c(1, 4, 8:11)])
+print("synthesis with original data, bootstrap, 5 iterations and a 1e-4 cp with pool.normal")
+print(confidence_interval5norm[,c(1, 4, 8:11)])
+print("synthesis with original data, bootstrap, 5 iterations and a 1e-32 cp with pool.normal")
+print(confidence_interval6norm[,c(1, 4, 8:11)])
+
+print("synthesis with imputed data with no bootstrap and a 1e-4 cp with pool3.syn")
+print(confidence_interval7[,c(1, 4, 8:11)])
+print("synthesis with imputed data with no bootstrap and a 1e-32 cp with pool3.syn")
+print(confidence_interval8[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 5 iterations, bootstrap and a 1e-4 cp with pool3.syn")
+print(confidence_interval9[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 5 iterations, bootstrap and a 1e-32 cp with pool3.syn")
+print(confidence_interval10[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 1 iteration, bootstrap and a 1e-4 cp with pool3.syn")
+print(confidence_interval11[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 1 iteration, bootstrap and a 1e-32 cp with pool3.syn")
+print(confidence_interval12[,c(1, 4, 8:11)])
+
+print("synthesis with imputed data with no bootstrap and a 1e-4 cp with pool.normal")
+print(confidence_interval7norm[,c(1, 4, 8:11)])
+print("synthesis with imputed data with no bootstrap and a 1e-32 cp with pool.normal")
+print(confidence_interval8norm[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 5 iterations, bootstrap and a 1e-4 cp with pool.normal")
+print(confidence_interval9norm[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 5 iterations, bootstrap and a 1e-32 cp with pool.normal")
+print(confidence_interval10norm[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 1 iteration, bootstrap and a 1e-4 cp with pool.normal")
+print(confidence_interval11norm[,c(1, 4, 8:11)])
+print("synthesis with imputed data with 1 iteration, bootstrap and a 1e-32 cp with pool.normal")
+print(confidence_interval12norm[,c(1, 4, 8:11)])
+```
+
+```{r}
+sessionInfo()
+```
